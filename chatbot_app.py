@@ -9,7 +9,6 @@ If filters are extracted but yield no results, pauses before generating final an
 Connects to Pinecone to retrieve relevant feedback chunks based on user query embeddings
 (generated via Vertex AI 'text-embedding-004') and extracted metadata filters. # <-- Filtering removed
 Uses Google Gemini ('models/gemini-2.0-flash-001') to generate an answer.
-Uses a Service Account JSON key file for Google Cloud authentication.
 Features sidebar 'New Chat' button and refined UI text.
 Includes intent check for greetings and similarity threshold for relevance.
 """
@@ -36,7 +35,6 @@ load_dotenv() # Load variables from .env file into environment
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # GCP Configuration
-SERVICE_ACCOUNT_KEY_PATH = os.getenv("SERVICE_ACCOUNT_KEY_PATH")
 GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID")
 GCP_LOCATION = os.getenv("GCP_LOCATION", "us-central1")
 
@@ -86,18 +84,13 @@ SIMPLE_GREETINGS = {"hi", "hello", "hey", "thanks", "thank you", "ok", "okay", "
 # --- Helper Functions (Adapted for Streamlit) ---
 
 @st.cache_resource(show_spinner="Initializing Vertex AI Embedding Model...")
-def get_vertex_embedding_model(project_id: str, location: str, service_account_path: str) -> Optional[TextEmbeddingModel]:
-    """Initializes and returns the Vertex AI TextEmbeddingModel using Service Account."""
+def get_vertex_embedding_model(project_id: str, location: str) -> Optional[TextEmbeddingModel]:
+    """Initializes and returns the Vertex AI TextEmbeddingModel."""
     st.session_state.vertex_model_initialized = False
     if not project_id: st.error("GCP_PROJECT_ID not found in .env."); return None
     if not location: st.error("GCP_LOCATION not found in .env."); return None
-    if not service_account_path: st.error("SERVICE_ACCOUNT_KEY_PATH not found in .env."); return None
-    if not os.path.exists(service_account_path): st.error(f"Service Account Key file not found: {service_account_path}"); return None
     try:
         # Set credentials only if they haven't been set or have changed
-        if os.environ.get("GOOGLE_APPLICATION_CREDENTIALS") != service_account_path:
-             os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = service_account_path
-             logging.info(f"Set GOOGLE_APPLICATION_CREDENTIALS to: {service_account_path}")
         logging.info(f"Initializing Vertex AI for project {project_id} in {location}...")
         aiplatform.init(project=project_id, location=location)
         logging.info(f"Loading Vertex AI TextEmbeddingModel: {VERTEX_MODEL_NAME}")
@@ -319,8 +312,8 @@ if not st.session_state.initialization_attempted:
     with st.spinner("Initializing connections from .env configuration..."):
         st.cache_resource.clear()
         # Ensure all necessary config vars are present for Vertex AI init
-        if SERVICE_ACCOUNT_KEY_PATH and GCP_PROJECT_ID and GCP_LOCATION:
-            st.session_state.vertex_model = get_vertex_embedding_model(GCP_PROJECT_ID, GCP_LOCATION, SERVICE_ACCOUNT_KEY_PATH)
+        if GCP_PROJECT_ID and GCP_LOCATION:
+            st.session_state.vertex_model = get_vertex_embedding_model(GCP_PROJECT_ID, GCP_LOCATION)
             if not st.session_state.vertex_model: init_errors = True
         else: st.sidebar.error("GCP config (Project ID, Location, Service Account Path) missing in .env"); init_errors = True
         if PINECONE_API_KEY and PINECONE_INDEX_NAME:
