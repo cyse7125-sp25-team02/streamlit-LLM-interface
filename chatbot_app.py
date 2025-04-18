@@ -3,13 +3,15 @@
 Streamlit application for querying course feedback using RAG.
 
 Loads configuration from a .env file.
-Includes LLM-based extraction of metadata filters from the user query.
-If no filters are extracted, prompts user for more specific query after a pause.
-If filters are extracted but yield no results, pauses before generating final answer.
+Includes LLM-based extraction of metadata filters from the user query. # <-- Comment remains, but functionality removed
+If no filters are extracted, prompts user for more specific query after a pause. # <-- Behavior changed
+If filters are extracted but yield no results, pauses before generating final answer. # <-- Behavior changed
 Connects to Pinecone to retrieve relevant feedback chunks based on user query embeddings
-(generated via Vertex AI 'text-embedding-004') and extracted metadata filters.
+(generated via Vertex AI 'text-embedding-004') and extracted metadata filters. # <-- Filtering removed
 Uses Google Gemini ('models/gemini-2.0-flash-001') to generate an answer.
+Uses a Service Account JSON key file for Google Cloud authentication.
 Features sidebar 'New Chat' button and refined UI text.
+Includes intent check for greetings and similarity threshold for relevance.
 """
 
 import os
@@ -21,14 +23,20 @@ from vertexai.language_models import TextEmbeddingModel, TextEmbeddingInput
 import logging
 import json # For parsing LLM response
 import streamlit as st # Import Streamlit
+from dotenv import load_dotenv # Import dotenv
 import time # Ensure time is imported
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Any # Added Any
 
+# --- Load Environment Variables ---
+load_dotenv() # Load variables from .env file into environment
+
+# --- Configuration & Constants (Loaded from Environment) ---
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # GCP Configuration
+SERVICE_ACCOUNT_KEY_PATH = os.getenv("SERVICE_ACCOUNT_KEY_PATH")
 GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID")
 GCP_LOCATION = os.getenv("GCP_LOCATION", "us-central1")
 
@@ -38,7 +46,7 @@ PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME")
 
 # Google Gemini Configuration
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-FILTER_EXTRACTION_MODEL_NAME = "models/gemini-2.0-flash-001"
+# FILTER_EXTRACTION_MODEL_NAME = "models/gemini-2.0-flash-001" # No longer needed for filtering
 GEMINI_ANSWER_MODEL_NAME = "models/gemini-2.0-flash-001"
 
 # RAG Parameters
@@ -47,13 +55,21 @@ try:
 except ValueError:
     logging.warning(f"Invalid TOP_K value in .env file. Defaulting to 5.")
     TOP_K = 5
-# NOTE: SIMILARITY_THRESHOLD constant and logic removed as requested previously.
+# ADDED: Similarity Threshold (Tune this value based on testing)
+# Scores typically range from 0 to 1. Higher means more similar.
+# A value between 0.7 and 0.8 might be a good starting point.
+try:
+    SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.75"))
+except ValueError:
+    logging.warning(f"Invalid SIMILARITY_THRESHOLD value in .env file. Defaulting to 0.75.")
+    SIMILARITY_THRESHOLD = 0.75
+
 
 # Constants for Vertex AI Embedding Model
 VERTEX_MODEL_NAME = "text-embedding-004"
 VERTEX_TASK_TYPE_QUERY = "RETRIEVAL_QUERY"
 
-# Metadata fields we want to filter on
+# Metadata fields we want to filter on # <-- List remains, but not used for filtering
 FILTERABLE_METADATA_KEYS = [
     "instructor_name",
     "course_code",
@@ -63,15 +79,25 @@ FILTERABLE_METADATA_KEYS = [
     "credit_hours"
 ]
 
+# ADDED: List of simple greetings/phrases to handle directly
+SIMPLE_GREETINGS = {"hi", "hello", "hey", "thanks", "thank you", "ok", "okay", "bye", "goodbye"}
+
+
 # --- Helper Functions (Adapted for Streamlit) ---
 
 @st.cache_resource(show_spinner="Initializing Vertex AI Embedding Model...")
-def get_vertex_embedding_model(project_id: str, location: str) -> Optional[TextEmbeddingModel]:
-    """Initializes and returns the Vertex AI TextEmbeddingModel."""
+def get_vertex_embedding_model(project_id: str, location: str, service_account_path: str) -> Optional[TextEmbeddingModel]:
+    """Initializes and returns the Vertex AI TextEmbeddingModel using Service Account."""
     st.session_state.vertex_model_initialized = False
     if not project_id: st.error("GCP_PROJECT_ID not found in .env."); return None
     if not location: st.error("GCP_LOCATION not found in .env."); return None
+    if not service_account_path: st.error("SERVICE_ACCOUNT_KEY_PATH not found in .env."); return None
+    if not os.path.exists(service_account_path): st.error(f"Service Account Key file not found: {service_account_path}"); return None
     try:
+        # Set credentials only if they haven't been set or have changed
+        if os.environ.get("GOOGLE_APPLICATION_CREDENTIALS") != service_account_path:
+             os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = service_account_path
+             logging.info(f"Set GOOGLE_APPLICATION_CREDENTIALS to: {service_account_path}")
         logging.info(f"Initializing Vertex AI for project {project_id} in {location}...")
         aiplatform.init(project=project_id, location=location)
         logging.info(f"Loading Vertex AI TextEmbeddingModel: {VERTEX_MODEL_NAME}")
@@ -96,10 +122,11 @@ def init_pinecone(api_key: str, index_name: str) -> Optional[pinecone.Index]:
         existing_indexes_list = None
         try:
             index_list_result = pc.list_indexes()
+            # Handle potential variations in the return type of list_indexes()
             if isinstance(index_list_result, list): existing_indexes_list = index_list_result
             elif hasattr(index_list_result, 'names'):
                  if callable(index_list_result.names): names_result = index_list_result.names()
-                 else: names_result = index_list_result.names
+                 else: names_result = index_list_result.names # Handle attribute access
                  if isinstance(names_result, list): existing_indexes_list = names_result
                  else: logging.error(f".names method/attribute did not return a list, type: {type(names_result)}"); return None
             else: logging.error(f"Unexpected type returned by pc.list_indexes(): {type(index_list_result)}."); return None
@@ -138,80 +165,7 @@ def configure_gemini(api_key: str) -> bool:
 
 # --- Filter Extraction, Embedding, Querying, Formatting, Generation Functions ---
 
-def extract_filters_with_llm(query: str, filter_keys: List[str], gemini_configured: bool) -> Optional[Dict]:
-    """Uses LLM to extract potential filter values from a user query."""
-    if not gemini_configured:
-        logging.error("Gemini is not configured for filter extraction.")
-        st.warning("Gemini not configured, cannot extract filters.")
-        return None
-    # Only attempt extraction if query is not just a greeting etc.
-    if len(query.split()) < 3 and not any(key in query.lower() for key in ['instructor', 'course', 'semester', 'assignment', 'feedback']):
-         logging.info(f"Query '{query}' seems too short or generic for filter extraction. Skipping.")
-         return None
-
-    prompt = f"""
-Analyze the following user query about course feedback. Intelligently extract keywords for the following categories using your NLP knowledge. Respond ONLY with a valid JSON object containing the extracted keys and their corresponding values. If a value for a category is not mentioned, omit the key from the JSON object.
-
-Ensure values for 'semester_year' and 'credit_hours' are numbers (integers). Other values should be strings.
-
-Categories to extract:
-- instructor_name: (string) The name of the instructor
-- course_code: (string) The course code, typically letters followed by numbers (e.g., "CSYE 6225", "INFO 7390").
-- course_name: (string) The name of the course
-- semester_term: (string) The semester term (e.g., "Spring", "Fall", "Summer").
-- semester_year: (integer) The specific year as a four-digit number (e.g., 2024, 2023).
-- credit_hours: (integer) The number of credit hours as a number (e.g., 4, 3).
-
-User Query: "{query}"
-
-JSON Output:
-"""
-    try:
-        logging.info(f"Attempting to extract filters from query: '{query}' using {FILTER_EXTRACTION_MODEL_NAME}")
-        model = genai.GenerativeModel(FILTER_EXTRACTION_MODEL_NAME)
-        response = model.generate_content(prompt)
-        raw_response_text = None
-        if hasattr(response, 'text'): raw_response_text = response.text
-        elif response.parts: raw_response_text = "".join(part.text for part in response.parts)
-
-        if not raw_response_text: logging.warning("LLM filter extraction returned empty response."); return None
-        logging.info(f"Raw LLM filter extraction response: {raw_response_text}")
-
-        json_match = re.search(r'\{.*\}', raw_response_text, re.DOTALL)
-        if not json_match: logging.warning("Could not find JSON object in LLM response for filters."); return None
-
-        json_string = json_match.group(0)
-        extracted_data = json.loads(json_string)
-        logging.info(f"Successfully parsed extracted filters: {extracted_data}")
-
-        pinecone_filter = {}
-        string_keys = ["instructor_name", "course_code", "course_name", "semester_term"]
-        integer_keys = ["semester_year", "credit_hours"]
-
-        for key, value in extracted_data.items():
-            if key in filter_keys and value is not None and value != "":
-                if key in string_keys:
-                    try: pinecone_filter[key] = str(value).lower()
-                    except Exception: logging.warning(f"Could not convert value for key '{key}' to string: {value}")
-                elif key in integer_keys:
-                    try: pinecone_filter[key] = int(value)
-                    except (ValueError, TypeError): logging.warning(f"Could not convert value for key '{key}' to integer: {value}. Skipping.")
-
-        if not pinecone_filter: logging.info("No relevant filters extracted or processed."); return None
-        logging.info(f"Constructed Pinecone filter: {pinecone_filter}")
-        return pinecone_filter
-    except json.JSONDecodeError:
-        logging.error(f"Failed to decode JSON from LLM filter response: {raw_response_text}", exc_info=True)
-        st.error("Could not parse filter information from LLM response.")
-        return None
-    except Exception as e:
-        if "response was blocked" in str(e).lower():
-             logging.warning(f"LLM filter extraction response blocked. Query: {query}")
-             st.warning("Filter extraction was blocked. Proceeding without filters.")
-             return None
-        logging.error(f"Error during LLM filter extraction: {e}", exc_info=True)
-        st.error(f"Failed to extract filters using LLM: {e}")
-        return None
+# Removed extract_filters_with_llm function as it's no longer needed
 
 def get_query_embedding(query: str, model: TextEmbeddingModel) -> Optional[List[float]]:
     """Generates embedding for the user query using Vertex AI."""
@@ -227,18 +181,19 @@ def get_query_embedding(query: str, model: TextEmbeddingModel) -> Optional[List[
         st.error(f"Failed to generate embedding for the query: {e}")
         return None
 
-def query_pinecone(index: pinecone.Index, index_name: str, query_embedding: List[float], top_k: int = 5, filter_dict: Optional[Dict] = None) -> List[Dict]:
-    """Queries Pinecone index, optionally applying metadata filters."""
+# Modified query_pinecone to remove filter_dict parameter usage internally
+def query_pinecone(index: pinecone.Index, index_name: str, query_embedding: List[float], top_k: int = 5) -> List[Dict[str, Any]]: # Added Any type hint
+    """Queries Pinecone index using only vector similarity."""
     if index is None: st.error("Pinecone index not initialized."); return []
     if not query_embedding: st.error("Cannot query Pinecone without a query embedding."); return []
+    # Only include necessary parameters for vector search
     query_params = {"vector": query_embedding, "top_k": top_k, "include_metadata": True}
-    log_filter_msg = "No metadata filter applied."
-    if filter_dict:
-        log_filter_msg = f"Applying metadata filter: {filter_dict}"
-        query_params["filter"] = filter_dict
+    log_filter_msg = "Performing vector search without metadata filters." # Updated log message
+    # Removed filter logic
     try:
         logging.info(f"Querying Pinecone index '{index_name}' with top_k={top_k}. {log_filter_msg}")
         results = index.query(**query_params)
+        # Ensure matches is always a list
         matches = results.get('matches', []) if results else []
         logging.info(f"Pinecone query returned {len(matches)} matches.")
         return matches
@@ -247,26 +202,48 @@ def query_pinecone(index: pinecone.Index, index_name: str, query_embedding: List
         st.error(f"Failed to query Pinecone: {e}")
         return []
 
-def format_context(matches: List[Dict]) -> str:
-    """Formats the retrieved Pinecone matches into a context string for the LLM."""
+# MODIFIED format_context function (No changes needed here from previous version)
+def format_context(matches: List[Dict[str, Any]]) -> str:
+    """
+    Formats the retrieved Pinecone matches into a context string for the LLM.
+    Includes full metadata for each snippet as requested.
+    """
     context = ""
-    if not matches: return "No relevant feedback found matching the criteria."
+    # Message updated slightly to reflect potential threshold filtering
+    if not matches: return "No sufficiently relevant feedback found matching the query."
+
     context += "Relevant Course Feedback Snippets:\n"
     context += "------------------------------------\n"
     for i, match in enumerate(matches):
         metadata = match.get('metadata', {})
-        text = metadata.get('original_text', 'N/A')
+        score = match.get('score', 0.0) # Similarity score
+
+        # Extract all relevant metadata fields for formatting
+        course_name = metadata.get('course_name', 'N/A')
+        course_code = metadata.get('course_code', 'N/A')
+        instructor_name = metadata.get('instructor_name', 'N/A')
+        semester_term = metadata.get('semester_term', 'N/A')
+        semester_year = metadata.get('semester_year', 'N/A')
+        credit_hours = metadata.get('credit_hours', 'N/A')
         question = metadata.get('question', 'N/A')
-        score = match.get('score', 0.0)
+        # Use 'original_text' for the feedback content
+        feedback_text = metadata.get('original_text', 'N/A')
+
+        # Construct the detailed snippet string
         context += f"Snippet {i+1} (Score: {score:.4f}):\n"
-        context += f"  Question Context: {question}\n"
-        context += f"  Feedback Text: {text}\n"
+        context += f"Course: {course_name} ({course_code})\n"
+        context += f"Instructor: {instructor_name}\n"
+        context += f"Semester: {semester_term} {semester_year}\n"
+        context += f"Credit Hours: {credit_hours}\n"
+        context += f"Question Context: {question}\n" # Changed label slightly for clarity
+        context += f"Feedback Text: {feedback_text}\n" # Displays original text with newlines
         context += "------------------------------------\n"
     return context
 
 def generate_answer_with_gemini(query: str, context: str, gemini_configured: bool) -> Optional[str]:
     """Generates an answer using Gemini based on the query and context."""
     if not gemini_configured: st.error("Gemini not configured. Cannot generate answer."); return None
+    # The prompt instructions remain the same, asking the LLM to synthesize from the provided snippets
     prompt = f"""
 You are a helpful assistant analyzing course feedback. Answer the following user query based *only* on the provided relevant course feedback snippets.
 
@@ -275,7 +252,7 @@ Do not use any prior knowledge or information outside of these snippets.
 Do not refer/cite specific snippet numbers (e.g., "Snippet 1") in your answer.
 Do not use words "snippet" or "snippets" in your answer, rather you can use "feedback" or "comments".
 Do not just list individual comments one by one (e.g., avoid saying "one person/feedback/student said X, another person/feedback/student said Y"), rather summarize the snippets.
-If the snippets do not contain enough information to answer the query, explicitly state that.
+If the snippets do not contain enough information to answer the query, explicitly state that. If the query is a simple greeting or unrelated chit-chat, respond appropriately without mentioning the snippets.
 
 User Query:
 "{query}"
@@ -293,10 +270,19 @@ Answer:
         response = model.generate_content(prompt)
         logging.info("Gemini response received.")
 
+        # Handle response variations
         if hasattr(response, 'text'): return response.text
         elif response.parts: return "".join(part.text for part in response.parts)
+        # Check for blocked response or empty candidates
         elif not response.candidates:
              logging.warning("Gemini response blocked or empty.")
+             # Check safety ratings if available (example structure, adjust based on actual API)
+             try:
+                 if response.prompt_feedback.block_reason:
+                      logging.warning(f"Response blocked due to: {response.prompt_feedback.block_reason}")
+                      return f"My response was blocked due to safety settings ({response.prompt_feedback.block_reason}). I cannot provide an answer based on the context."
+             except AttributeError:
+                 pass # No block reason info available
              return "I cannot provide an answer based on the provided context, possibly due to safety settings or lack of information."
         else:
             logging.warning(f"Unexpected Gemini response structure: {response}")
@@ -314,7 +300,7 @@ Answer:
 st.set_page_config(page_title="Course Feedback RAG", layout="wide")
 st.title("📚 Course Feedback Analysis (RAG + Gemini)")
 # --- Updated Caption ---
-st.caption("Ask questions about course feedback. Mention correct information on courses, instructors, etc., to get proper results.")
+st.caption("Ask questions about course feedback. Mention correct information on courses, instructors, etc., to get proper results.") # Caption remains relevant
 
 # --- Initialize Session State Variables ---
 if "pinecone_index" not in st.session_state: st.session_state.pinecone_index = None
@@ -332,10 +318,11 @@ if not st.session_state.initialization_attempted:
     init_errors = False
     with st.spinner("Initializing connections from .env configuration..."):
         st.cache_resource.clear()
-        if GCP_PROJECT_ID and GCP_LOCATION:
-            st.session_state.vertex_model = get_vertex_embedding_model(GCP_PROJECT_ID, GCP_LOCATION)
+        # Ensure all necessary config vars are present for Vertex AI init
+        if SERVICE_ACCOUNT_KEY_PATH and GCP_PROJECT_ID and GCP_LOCATION:
+            st.session_state.vertex_model = get_vertex_embedding_model(GCP_PROJECT_ID, GCP_LOCATION, SERVICE_ACCOUNT_KEY_PATH)
             if not st.session_state.vertex_model: init_errors = True
-        else: st.sidebar.error("GCP config missing in .env"); init_errors = True
+        else: st.sidebar.error("GCP config (Project ID, Location, Service Account Path) missing in .env"); init_errors = True
         if PINECONE_API_KEY and PINECONE_INDEX_NAME:
             st.session_state.pinecone_index = init_pinecone(PINECONE_API_KEY, PINECONE_INDEX_NAME)
             if not st.session_state.pinecone_index: init_errors = True
@@ -364,10 +351,13 @@ for i, message in enumerate(st.session_state.messages):
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
         if message["role"] == "assistant":
-            if message.get("filters"):
-                with st.expander("Applied Filters"): st.json(message["filters"])
-            if message.get("context") and not message.get("context", "").startswith("No relevant") and not message.get("context", "").startswith("Search skipped"):
-                 with st.expander("Retrieved Context"): st.text(message["context"])
+            # Removed filter display logic
+            # Display context only if it's not the "No relevant feedback" message
+            # The context now contains the full metadata per snippet
+            # Added check for "context_used" flag to avoid showing context for greetings
+            if message.get("context_used", False) and message.get("context") and not message.get("context", "").startswith("No relevant"):
+                 with st.expander("Retrieved Context (Full Details)"): # Updated expander title
+                      st.text(message["context"]) # Display the fully formatted context
 
 # Get user input
 user_query = st.chat_input("Ask about course feedback... (e.g., How is Network Structures and Cloud Computing course?)")
@@ -376,83 +366,97 @@ if user_query:
     st.session_state.messages.append({"role": "user", "content": user_query})
     with st.chat_message("user"): st.markdown(user_query)
 
+    # Check if services are initialized
     vertex_ok = st.session_state.get("vertex_model_initialized", False)
     pinecone_ok = st.session_state.get("pinecone_initialized", False)
     gemini_ok = st.session_state.get("gemini_configured", False)
     vertex_model_obj = st.session_state.get("vertex_model")
     pinecone_index_obj = st.session_state.get("pinecone_index")
 
+    # --- MODIFIED: Intent Check and RAG Pipeline ---
     if vertex_ok and pinecone_ok and gemini_ok and vertex_model_obj and pinecone_index_obj:
-        with st.spinner("Thinking..."):
-            assistant_response_content = None
-            extracted_filter_dict = None
-            retrieved_context_str = "No relevant feedback found." # Default context
-            matches = [] # Initialize matches
 
-            logging.info("Step 1/X: Extracting filters...")
-            extracted_filter_dict = extract_filters_with_llm(
-                user_query, FILTERABLE_METADATA_KEYS, gemini_ok
-            )
+        # 1. Intent Check for simple greetings
+        normalized_query = user_query.lower().strip().rstrip('?.!')
+        if normalized_query in SIMPLE_GREETINGS:
+            logging.info(f"Detected simple greeting: '{user_query}'. Skipping RAG.")
+            # Provide a direct response without hitting Pinecone or Gemini RAG
+            if normalized_query in {"thanks", "thank you"}:
+                assistant_response_content = "You're welcome! Let me know if you have questions about course feedback."
+            elif normalized_query in {"bye", "goodbye"}:
+                assistant_response_content = "Goodbye!"
+            else: # Default greeting response
+                assistant_response_content = "Hello! How can I help you with course feedback today?"
+            retrieved_context_str = "No context needed for greeting."
+            context_was_used = False # Flag to prevent showing context expander
 
-            # --- Conditional Logic: Check if filters were extracted ---
-            if extracted_filter_dict is None:
-                logging.info("No filters extracted, providing default message.")
-                # --- Add pause before showing default message ---
-                time.sleep(2)
-                # --- Update default message ---
-                assistant_response_content = "Please mention some information on courses or instructors to get relevant results."
-                retrieved_context_str = "Search skipped as no filters were extracted."
-                # Skip embedding, query, format, generate steps
-            else:
-                # --- Proceed with RAG pipeline if filters ARE extracted ---
-                log_filter_msg = f"Filters: {json.dumps(extracted_filter_dict)}"
-                logging.info(f"Step 2/5: Generating query embedding... ({log_filter_msg})")
+        else: # Not a simple greeting, proceed with RAG pipeline
+            with st.spinner("Thinking..."):
+                assistant_response_content = None
+                retrieved_context_str = f"No feedback found with similarity above {SIMILARITY_THRESHOLD}." # Default context
+                matches = [] # Initialize matches
+                context_was_used = False # Default to false
+
+                # Step 1: Generate query embedding
+                logging.info(f"Step 1/4: Generating query embedding...")
                 query_embedding = get_query_embedding(user_query, vertex_model_obj)
 
                 if query_embedding:
-                    logging.info(f"Step 3/5: Querying vector database... ({log_filter_msg})")
+                    # Step 2: Query vector database
+                    logging.info(f"Step 2/4: Querying vector database...")
                     matches = query_pinecone(
                         index=pinecone_index_obj,
                         index_name=PINECONE_INDEX_NAME,
                         query_embedding=query_embedding,
-                        top_k=TOP_K,
-                        filter_dict=extracted_filter_dict
+                        top_k=TOP_K
                     )
 
-                    # --- Add pause if query returned no matches ---
-                    if not matches:
-                        logging.info("Query with filters returned no matches. Pausing.")
-                        time.sleep(2)
-                    # --- End pause logic ---
+                    # Step 3: Check Similarity Threshold and Format Context
+                    if matches:
+                        top_score = matches[0].get('score', 0.0)
+                        logging.info(f"Top match score: {top_score:.4f} (Threshold: {SIMILARITY_THRESHOLD})")
+                        if top_score >= SIMILARITY_THRESHOLD:
+                            logging.info(f"Step 3/4: Formatting context (Score >= Threshold)...")
+                            retrieved_context_str = format_context(matches)
+                            context_was_used = True # Mark that relevant context was found and formatted
+                        else:
+                             logging.info(f"Top match score below threshold. Discarding context.")
+                             # Keep retrieved_context_str as the default "No feedback found..." message
+                             matches = [] # Treat as no matches found for context formatting/display
+                             context_was_used = False
+                    else:
+                        # No matches found from Pinecone
+                        logging.info("Vector search returned no matches.")
+                        retrieved_context_str = "No relevant feedback found matching the query."
+                        context_was_used = False
 
-                    # NOTE: No similarity score filtering applied here
-                    final_matches_for_context = matches
-                    logging.info(f"Retrieved {len(final_matches_for_context)} matches from Pinecone.")
 
-                    logging.info(f"Step 4/5: Formatting context...")
-                    retrieved_context_str = format_context(final_matches_for_context) # Will return "No relevant..." if matches is empty
-
-                    logging.info("Step 5/5: Generating answer...")
+                    # Step 4: Generate answer (always called, but context varies)
+                    logging.info("Step 4/4: Generating answer...")
+                    # Pass the potentially modified context string to Gemini
                     assistant_response_content = generate_answer_with_gemini(
                         user_query, retrieved_context_str, gemini_ok
                     )
-                else:
+
+                else: # Embedding generation failed
                     st.error("Could not generate embedding for the query.")
                     assistant_response_content = "Sorry, I encountered an error processing your query (embedding failed)."
-            # --- End Conditional Logic ---
+                    retrieved_context_str = "Search skipped due to embedding error."
+                    context_was_used = False
 
-        # Add assistant message to history (either default or generated)
+        # Add assistant message to history
         assistant_message = {
             "role": "assistant",
             "content": assistant_response_content if assistant_response_content else "Sorry, I encountered an error generating the response.",
-            "filters": extracted_filter_dict, # Store filters (even if None)
-            "context": retrieved_context_str # Store context (or skip message)
+            "context": retrieved_context_str, # Store context (or relevant message)
+            "context_used": context_was_used # Store flag for UI display logic
         }
         st.session_state.messages.append(assistant_message)
-        st.rerun()
+        st.rerun() # Rerun to display the new message
 
-    else:
+    else: # Services not initialized
         st.warning("Services not initialized. Please check your `.env` file and restart the application.")
+        # Clean up user message if services fail after input
         if st.session_state.messages:
              if st.session_state.messages[-1]["role"] == "user":
                 st.session_state.messages.pop()
