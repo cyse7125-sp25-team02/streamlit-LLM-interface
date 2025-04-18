@@ -22,14 +22,8 @@ from vertexai.language_models import TextEmbeddingModel, TextEmbeddingInput
 import logging
 import json # For parsing LLM response
 import streamlit as st # Import Streamlit
-from dotenv import load_dotenv # Import dotenv
 import time # Ensure time is imported
 from typing import List, Dict, Optional, Tuple, Any # Added Any
-
-# --- Load Environment Variables ---
-load_dotenv() # Load variables from .env file into environment
-
-# --- Configuration & Constants (Loaded from Environment) ---
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
