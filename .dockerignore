@@ -1,0 +1,14 @@
+# .dockerignore
+
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env* # IMPORTANT: Do not include your secrets file in the image!
+.git/
+.gitignore
+Dockerfile
+*.md
